@@ -56,6 +56,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js
 import {
   describeGeminiFailure,
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
   isGeminiTransientNetworkError,
   isGeminiTurnLimitResult,
   isGeminiSessionUnrecoverableError,
@@ -752,20 +753,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
+   try {
     const initial = await runAttempt(sessionId);
-    if (
-      sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      isGeminiSessionUnrecoverableError(initial.proc.stdout, initial.proc.stderr)
-    ) {
-      await onLog(
-        "stdout",
-        `[paperclip] Gemini resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-      );
-      const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+    if (sessionId && !initial.proc.timedOut && (initial.proc.exitCode ?? 0) !== 0) {
+      // Known wording for a dead/orphaned resume target (kept first: gives the
+      // most specific, human-readable reason in the log when it matches).
+      const knownStaleSession = isGeminiSessionUnrecoverableError(initial.proc.stdout, initial.proc.stderr);
+
+      // Failure classes that are NOT about the session being stale — retrying
+      // with a fresh session would not help (and would just double the cost
+      // of an auth/network/quota/turn-limit problem the user still needs to
+      // see). Only fall through to "assume orphaned session" when none of
+      // these match, so this stays a safe default instead of relying on
+      // Gemini CLI's exact current error wording.
+      const authMeta = detectGeminiAuthRequired({
+        parsed: initial.parsed.resultEvent,
+        stdout: initial.proc.stdout,
+        stderr: initial.proc.stderr,
+      });
+      const networkUnavailable = isGeminiTransientNetworkError(initial.proc.stdout, initial.proc.stderr);
+      const quotaExhausted = detectGeminiQuotaExhausted({
+        parsed: initial.parsed.resultEvent,
+        stdout: initial.proc.stdout,
+        stderr: initial.proc.stderr,
+      }).exhausted;
+      const turnLimitExhausted = isGeminiTurnLimitResult(initial.parsed.resultEvent, initial.proc.exitCode);
+
+      const treatAsOrphanedSession =
+        knownStaleSession ||
+        (!authMeta.requiresAuth && !networkUnavailable && !quotaExhausted && !turnLimitExhausted);
+
+      if (treatAsOrphanedSession) {
+        await onLog(
+          "stdout",
+          knownStaleSession
+            ? `[paperclip] Gemini resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`
+            : `[paperclip] Gemini resume session "${sessionId}" failed for an unrecognized reason (not auth/network/quota/turn-limit); assuming the session is orphaned and retrying once with a fresh session.\n`,
+        );
+        const retry = await runAttempt(null);
+        return toResult(retry, true, true);
+      }
     }
 
     return toResult(initial);
